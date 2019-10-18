@@ -1,0 +1,383 @@
+1.SecurityContextPersistenceFilter    key"SPRING_SECURITY_CONTEXT"
+
+	->1设置request作用域__spring_security_scpf_applied的值 发现有了 就不走次过滤器的功能，确保只执行了一次
+	->2.根据 forceEagerSessionCreation （boolean）的值 来确定是否强制创建session
+	->3.包装HttpRequestResponseHolder 里面只有两个属性 HttpServletRequest和 HttpServletResponse两个属性
+	->4 SecurityContext  repo.loadContext(holder);  获取SecurityContext
+		  -->1获取session 注意 创建对象使用false 不存在则取不到session实例
+
+		  -->2该方法整体上就是为  封装好的HttpRequestResponseHolder 的response属性设置包装好了HttpServletResponse ==>包装类 SaveToSessionResponseWrapper
+		  -->(流程  创建SecurityContext 利用ThreadLocalSecurityContextHolderStrategy实例 理解：ThreadLocalSecurityContextHolderStrategy实例本身是线程安全的，但是前提条件必须是一个单例
+		  		而他的实例被一个只有静态方法的类管理--》达到了只创建一次一直使用的标准 所以整体看来是线程安全的 并且跟线程绑定
+		  		结论  SecurityContext肯定不是null 并且和线程绑定   ---SecurityContextHolder这个类就是上面说的只有静态方法的那个类里面有一个不变的ThreadLocalSecurityContextHolderStrategy实例)
+	-》5 总结走向下一个过滤器之前的方法 主要完成2个功能 1生成 SecurityContext 并利用	SecurityContextHolder存储（线程安全）
+		 								   2封装的HttpRequestResponseHolder 的response被做了进一步包装 并且跟是否是servlet3有关系***细节不明
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpServletResponse response = (HttpServletResponse) res;
+		if (request.getAttribute(FILTER_APPLIED) != null) {
+			// ensure that filter is only applied once per request
+			chain.doFilter(request, response);
+			return;
+		}
+		final boolean debug = logger.isDebugEnabled();
+		request.setAttribute(FILTER_APPLIED, Boolean.TRUE);
+		if (forceEagerSessionCreation) {
+			HttpSession session = request.getSession();
+			if (debug && session.isNew()) {
+				logger.debug("Eagerly created session: " + session.getId());
+			}
+		}
+		HttpRequestResponseHolder holder = new HttpRequestResponseHolder(request,
+				response);
+		SecurityContext contextBeforeChainExecution = repo.loadContext(holder);
+		try {
+			//在外面设置 创建的时候没有直接设置
+			SecurityContextHolder.setContext(contextBeforeChainExecution);
+			//response 和 requset被从新包装的 其实只从新包装了response request并没有被包装
+			chain.doFilter(holder.getRequest(), holder.getResponse());
+		}
+		finally {
+			//先取出SecurityContext上下文
+			SecurityContext contextAfterChainExecution = SecurityContextHolder
+					.getContext();
+			// Crucial removal of SecurityContextHolder contents - do this before anything
+			// else.
+			//再清除
+			SecurityContextHolder.clearContext();
+			//并将SecurityContext保存到Session中。-->key: "SPRING_SECURITY_CONTEXT_KEY"
+			repo.saveContext(contextAfterChainExecution, holder.getRequest(),
+					holder.getResponse());
+			request.removeAttribute(FILTER_APPLIED);
+
+			if (debug) {
+				logger.debug("SecurityContextHolder now cleared, as request processing completed");
+			}
+		}
+	-》6	=====================================================================================================
+2.WebAsyncManagerIntegrationFilter	提供了对securityContext和WebAsyncManager的集成，其会把SecurityContext设置到异步线程中，使其也能获取到用户上下文认证信息。
+	1 获取WebAsyncManager 一个应用只有一个，存在ServletContext 实例 key 为 "org.springframework.web.context.request.async.WebAsyncManager.WEB_ASYNC_MANAGER"
+	2java.lang.Object@6b241c44
+3.HeaderWriterFilter  用来给http response添加一些Header，比如X-Frame-Options、X-XSS-Protection*、X-Content-Type-Options。 (inner bean)#1ca31fff.FILTERED java.lang.Object@6b241c44
+4.LogoutFilter
+	public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletRequest request = (HttpServletRequest) req;
+        HttpServletResponse response = (HttpServletResponse) res;
+        // 判断是否需要logout，判断request url是否匹配/logout
+        if (requiresLogout(request, response)) {
+            Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+
+            if (logger.isDebugEnabled()) {
+                logger.debug("Logging out user '" + auth
+                        + "' and transferring to logout destination");
+            }
+            // 执行一系列的退出登录操作
+            for (LogoutHandler handler : handlers) {
+                handler.logout(request, response, auth);
+            }
+            // 退出成功，执行logoutSuccessHandler进行重定向等操作
+            logoutSuccessHandler.onLogoutSuccess(request, response, auth);
+            return;
+        }
+        chain.doFilter(request, response);
+    }
+5.UsernamePasswordAuthenticationFilter表单认证是最常用的一个认证方式，一个最直观的业务场景便是允许用户在表单中输入用户名和密码进行登录，而这背后的UsernamePasswordAuthenticationFilter，在整个Spring Security的认证体系中则扮演着至关重要的角色。
+UsernamePasswordAuthenticationFilter是继承自AbstractAuthenticationProcessingFilter。
+public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+			throws IOException, ServletException {
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpServletResponse response = (HttpServletResponse) res;
+		// 判断是否需要执行登录认证，判断request url 是否能匹配/login POST
+		//不需要验证 不是 (POST 并且 /login) 直接放行
+		if (!requiresAuthentication(request, response)) {
+			chain.doFilter(request, response);
+			return;
+		}
+		if (logger.isDebugEnabled()) {
+			logger.debug("Request is to process authentication");
+		}
+		Authentication authResult;
+		try {
+			authResult = attemptAuthentication(request, response);
+			if (authResult == null) {
+				// return immediately as subclass has indicated that it hasn't completed
+				// authentication
+				return;
+			}
+			sessionStrategy.onAuthentication(authResult, request, response);
+		}
+		catch (InternalAuthenticationServiceException failed) {
+			logger.error(
+					"An internal error occurred while trying to authenticate the user.",
+					failed);
+			unsuccessfulAuthentication(request, response, failed);
+
+			return;
+		}
+		catch (AuthenticationException failed) {
+			// Authentication failed
+			unsuccessfulAuthentication(request, response, failed);
+
+			return;
+		}
+		// Authentication success
+		if (continueChainBeforeSuccessfulAuthentication) {
+			chain.doFilter(request, response);
+		}
+		successfulAuthentication(request, response, chain, authResult);
+	}
+6.DefaultLoginPageGeneratingFilter 自动生成登录页面
+
+	public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+			throws IOException, ServletException {
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpServletResponse response = (HttpServletResponse) res;
+		//是不是errorPage 规则  是get请求    /login?error
+		boolean loginError = isErrorPage(request);
+		是登出页  规则 是get请求 /login?logout
+		boolean logoutSuccess = isLogoutSuccess(request);
+		//返回错误页面  过滤器链不继续进行
+		if (isLoginUrlRequest(request) || loginError || logoutSuccess) {
+			String loginPageHtml = generateLoginPageHtml(request, loginError,
+					logoutSuccess);
+			response.setContentType("text/html;charset=UTF-8");
+			response.setContentLength(loginPageHtml.length());
+			response.getWriter().write(loginPageHtml);
+
+			return;
+		}
+
+		chain.doFilter(request, response);
+	}
+7.BasicAuthenticationFilter 暂时用不上 request.getHeader("Authorization") ！=null &&header.startsWith("Basic ")才会执行该过滤器;
+
+8.RequestCacheAwareFilter ????????????
+//将request存到session中，用于缓存request请求，可以用于恢复被登录而打断的请求
+public void doFilter(ServletRequest request, ServletResponse response,
+			FilterChain chain) throws IOException, ServletException {
+		// 从session中获取与当前request匹配的缓存request，并将缓存request从session删除
+		HttpServletRequest wrappedSavedRequest = requestCache.getMatchingRequest(
+				(HttpServletRequest) request, (HttpServletResponse) response);
+		 // 如果requestCache中缓存了request，则使用缓存的request
+		chain.doFilter(wrappedSavedRequest == null ? request : wrappedSavedRequest,
+				response);
+	}
+
+9.SecurityContextHolderAwareRequestFilter	 此过滤器对ServletRequest进行了一次包装，使得request具有更加丰富的API ???????????????
+chain.doFilter(requestFactory.create((HttpServletRequest) req,
+				(HttpServletResponse) res), res);
+
+10.AnonymousAuthenticationFilter  设置SecurityContextHolder
+	//
+	public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+			throws IOException, ServletException {
+			//没登录就是null
+		if (SecurityContextHolder.getContext().getAuthentication() == null) {
+			//给SecurityContext上下文设置Authentication  注意是没有登录才设置
+			设置为AnonymousAuthenticationToken 具体就是	AnonymousAuthenticationToken 都是默认的名字  也有ip信息 sessionID
+			SecurityContextHolder.getContext().setAuthentication(
+					createAuthentication((HttpServletRequest) req));
+			if (logger.isDebugEnabled()) {
+				logger.debug("Populated SecurityContextHolder with anonymous token: '"
+						+ SecurityContextHolder.getContext().getAuthentication() + "'");
+			}
+		}
+		else {
+			if (logger.isDebugEnabled()) {
+				logger.debug("SecurityContextHolder not populated with anonymous token, as it already contained: '"
+						+ SecurityContextHolder.getContext().getAuthentication() + "'");
+			}
+		}
+		chain.doFilter(req, res);
+	}
+	//给SecurityContext上下文设置Authentication
+	//如果没有登录 保存 AnonymousAuthenticationToken
+	protected Authentication createAuthentication(HttpServletRequest request) {
+		AnonymousAuthenticationToken auth = new AnonymousAuthenticationToken(key,
+				principal, authorities);
+		auth.setDetails(authenticationDetailsSource.buildDetails(request));
+
+		return auth;
+	}
+11.SessionManagementFilter	 和session相关的过滤器，内部维护了一个SessionAuthenticationStrategy，
+			两者组合使用，常用来防止session-fixation protection attack，以及限制同一用户开启多个会话的数量
+			与登录认证拦截时作用一样，持久化用户登录信息，可以保存到session中，也可以保存到cookie或者redis中。
+			HttpSessionSecurityContextRepository
+public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+			throws IOException, ServletException {
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpServletResponse response = (HttpServletResponse) res;
+
+		if (request.getAttribute(FILTER_APPLIED) != null) {
+			chain.doFilter(request, response);
+			return;
+		}
+		request.setAttribute(FILTER_APPLIED, Boolean.TRUE);
+		if (!securityContextRepository.containsContext(request)) {
+			Authentication authentication = SecurityContextHolder.getContext()
+					.getAuthentication();
+
+			if (authentication != null && !trustResolver.isAnonymous(authentication)) {
+				// The user has been authenticated during the current request, so call the
+				// session strategy
+				try {
+					sessionAuthenticationStrategy.onAuthentication(authentication,
+							request, response);
+				}
+				catch (SessionAuthenticationException e) {
+					// The session strategy can reject the authentication
+					logger.debug(
+							"SessionAuthenticationStrategy rejected the authentication object",
+							e);
+					SecurityContextHolder.clearContext();
+					failureHandler.onAuthenticationFailure(request, response, e);
+
+					return;
+				}
+				// Eagerly save the security context to make it available for any possible
+				// re-entrant
+				// requests which may occur before the current request completes.
+				// SEC-1396.
+				securityContextRepository.saveContext(SecurityContextHolder.getContext(),
+						request, response);
+			}
+			else {
+				// No security context or authentication present. Check for a session
+				// timeout
+				if (request.getRequestedSessionId() != null
+						&& !request.isRequestedSessionIdValid()) {
+					if (logger.isDebugEnabled()) {
+						logger.debug("Requested session ID "
+								+ request.getRequestedSessionId() + " is invalid.");
+					}
+					if (invalidSessionStrategy != null) {
+						invalidSessionStrategy
+								.onInvalidSessionDetected(request, response);
+						return;
+					}
+				}
+			}
+		}
+		chain.doFilter(request, response);
+	}
+12.ExceptionTranslationFilter
+	异常拦截，其处在Filter链后部分，只能拦截其后面的节点并且只处理AuthenticationException与AccessDeniedException两个异常。
+	AuthenticationException指的是未登录状态下访问受保护资源，AccessDeniedException指的是登陆了但是由于权限不足（比如普通用户访问管理员界面）。
+public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+			throws IOException, ServletException {
+		HttpServletRequest request = (HttpServletRequest) req;
+		HttpServletResponse response = (HttpServletResponse) res;
+
+		try {
+			chain.doFilter(request, response);
+
+			logger.debug("Chain processed normally");
+		}
+		catch (IOException ex) {
+			throw ex;
+		}
+		catch (Exception ex) {
+			// Try to extract a SpringSecurityException from the stacktrace
+			// 从异常堆栈中提取SpringSecurityException
+			Throwable[] causeChain = throwableAnalyzer.determineCauseChain(ex);
+			RuntimeException ase = (AuthenticationException) throwableAnalyzer
+					.getFirstThrowableOfType(AuthenticationException.class, causeChain);
+
+			if (ase == null) {
+				ase = (AccessDeniedException) throwableAnalyzer.getFirstThrowableOfType(
+						AccessDeniedException.class, causeChain);
+			}
+
+			if (ase != null) {
+				// 处理异常
+				handleSpringSecurityException(request, response, chain, ase);
+			}
+			else {
+				// Rethrow ServletExceptions and RuntimeExceptions as-is
+				if (ex instanceof ServletException) {
+					throw (ServletException) ex;
+				}
+				else if (ex instanceof RuntimeException) {
+					throw (RuntimeException) ex;
+				}
+
+				// Wrap other Exceptions. This shouldn't actually happen
+				// as we've already covered all the possibilities for doFilter
+				throw new RuntimeException(ex);
+			}
+		}
+	}
+	-->LoginUrlAuthenticationEntryPoint 无权访问
+13 FilterSecurityInterceptor
+
+public void doFilter(ServletRequest request, ServletResponse response,
+			FilterChain chain) throws IOException, ServletException {
+		FilterInvocation fi = new FilterInvocation(request, response, chain);
+		invoke(fi);
+	}
+/
+public void invoke(FilterInvocation fi) throws IOException, ServletException {
+		//如果当前request是被转发过来的 直接放行？？？？ 确保只处理一次次？、
+		if ((fi.getRequest() != null)
+				&& (fi.getRequest().getAttribute(FILTER_APPLIED) != null)
+				&& observeOncePerRequest) {
+			// filter already applied to this request and user wants us to observe
+			// once-per-request handling, so don't re-do security checking
+			fi.getChain().doFilter(fi.getRequest(), fi.getResponse());
+		}
+		else {
+			// first time this request being called, so perform security checking
+			if (fi.getRequest() != null) {
+				fi.getRequest().setAttribute(FILTER_APPLIED, Boolean.TRUE);
+			}
+
+			InterceptorStatusToken token = super.beforeInvocation(fi);
+
+			try {
+				fi.getChain().doFilter(fi.getRequest(), fi.getResponse());
+			}
+			finally {
+				super.finallyInvocation(token);
+			}
+
+			super.afterInvocation(token, null);
+		}
+	}
+
+补充 ExpressionBasedFilterInvocationSecurityMetadataSource 能判断出需不需要登录 需不需要角色 权限。。。猜测
+
+AccessDecisionManager 决策管理器
+====>>>>登录 ====		 	AbstractAuthenticationProcessingFilter.dofilter-->会判断需不需要登录（是不是想进来登录 是否匹配）不匹配就放行，匹配后进入登录流程
+
+调用 attemptAuthentication 抽象父类的抽象方法 由 当前username..filter对象重写---》	 封装成UsernamePasswordAuthenticationToken	 设置detail类型为WebAuthenticationDetails 提供了sessionId和ip地址
+====>获取AuthenticationManager 默认为ProviderManager凭证管理器 调用authenticate认证方法 返回认证对象，管理器会循环遍历所有的认证匹配器进行认证操作 默认的集合中只有AnonymousAuthenticationProvider
+他的parent属性还是一个ProviderManager 里面的认证匹配器集合只有一个 是 DaoAuthenticationProvider 具体怎么回事不知道 调用该对象认证方法 是在父类AbstractUserDetailsAuthenticationProvider中定义的
+这里面有userCache 属性		UserCache  为缓存提供了条件**	在父类中先缓存获取，获取不到 通过   被子类重写的 方法 ，利用属性UserDetailsService 去加载用户加载不到跑出异常，加载到了则
+AbstractUserDetailsAuthenticationProvider$DefaultPreAuthenticationChecks 。check方法 1判断是否被锁2isEnabled();3isAccountNonExpired
+调用additionalAuthenticationChecks（user）这里面处理加盐  PasswordEncoder他来处理密码是否一致 不一致 抛出BadCredentialsException
+处理SimpleUrlAuthenticationFailureHandler 这个过滤器的父类 进行的是重定向操作
+
+
+auto-config false:
+org.springframework.security.web.context.SecurityContextPersistenceFilter@3b5f65b1
+org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter@132a477a
+org.springframework.security.web.header.HeaderWriterFilter@78a3844f
+org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter@16e3aab
+org.springframework.security.web.savedrequest.RequestCacheAwareFilter@41dcb5da
+org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter@8c3b0c
+org.springframework.security.web.authentication.AnonymousAuthenticationFilter@64e946ae
+org.springframework.security.web.session.SessionManagementFilter@14a283fa
+org.springframework.security.web.access.ExceptionTranslationFilter@307496d1
+
+org.springframework.security.web.context.SecurityContextPersistenceFilter@174a896c
+org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter@443a5a6a
+org.springframework.security.web.header.HeaderWriterFilter@67f36ac7
+org.springframework.security.web.authentication.logout.LogoutFilter@7e513e50
+org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter@3d13c91f
+org.springframework.security.web.authentication.www.BasicAuthenticationFilter@2b6c3ddd
+org.springframework.security.web.savedrequest.RequestCacheAwareFilter@57b5cf25
+org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter@2061d83d
+org.springframework.security.web.authentication.AnonymousAuthenticationFilter@319b61f
+org.springframework.security.web.session.SessionManagementFilter@49d1e174
+org.springframework.security.web.access.ExceptionTranslationFilter@30e4c38c
+org.springframework.security.web.access.intercept.FilterSecurityInterceptor@1e6a459d
